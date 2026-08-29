@@ -1,5 +1,4 @@
 click
 requests
 urllib3
-datetime
 pycryptodome
