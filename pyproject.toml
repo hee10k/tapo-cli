@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tapo-cli"
+version = "1.0.0"
+description = "Command-line application for batch-downloading your videos from the Tapo TP-Link Cloud"
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = [
+    "click",
+    "requests",
+    "urllib3",
+    "pycryptodome"
+]
+
+[project.scripts]
+tapo-cli = "tapo_cli:main"
+tapo = "tapo_cli:main"

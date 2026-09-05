@@ -8,6 +8,9 @@
 # Copyright Dimme 2023
 
 import os
+import sys
+import subprocess
+import tempfile
 import click
 import requests
 import urllib3
@@ -21,6 +24,35 @@ import re
 import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
+
+# Ensure UTF-8 output on Windows consoles to prevent cp949 / charmap UnicodeEncodeErrors
+if sys.platform == 'win32':
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+def sanitize_filename(name: str) -> str:
+    """Sanitizes a string to make it safe for use as a directory or file name on Windows, macOS, and Linux."""
+    if not name:
+        return 'unnamed'
+    # Strip characters invalid on Windows: < > : " / \ | ? * and ASCII control characters
+    sanitized = re.sub(r'[\x00-\x1f\\/*?:"<>|]', '_', name)
+    # Strip leading/trailing spaces and dots which are invalid on Windows
+    sanitized = sanitized.strip(' .')
+    # Check for Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    reserved_names = {
+        'CON', 'PRN', 'AUX', 'NUL',
+        *(f'COM{i}' for i in range(1, 10)),
+        *(f'LPT{i}' for i in range(1, 10))
+    }
+    if sanitized.upper() in reserved_names:
+        sanitized = f"_{sanitized}_"
+    return sanitized if sanitized else 'unnamed'
+
 
 # Secrets extracted from the .apk
 access_key = '4d11b6b9d5ea4d19a829adbb9714b057'
@@ -73,10 +105,9 @@ def config_path():
     return os.path.join(os.path.expanduser('~'), '.tapo-cli', '.config')
 
 # Gets authorization token from ~/.tapo-cli/.config
-# No idea if this works on Windows, what are you, some kind of psychopath?
 def get_config():
     try:
-        with open(config_path(), 'r') as file:
+        with open(config_path(), 'r', encoding='utf-8') as file:
             config = json.loads(file.read())
         token = config['token']
     except (IOError, OSError, ValueError, KeyError):
@@ -141,9 +172,9 @@ def get(url, params, headers):
 def post(url, data, headers):
     return json.loads(requests.post(url, data = data, headers = headers, verify = False).text)
 
-# Downloads a file from the Intenetz and decrypts it
+# Downloads a file from the Internet and decrypts it
 def download(url, key_b64, file_path, file_name):
-    if not os.path.exists(file_path): os.makedirs(file_path)
+    os.makedirs(file_path, exist_ok=True)
 
     res = requests.get(url)
     content = res.content
@@ -157,8 +188,25 @@ def download(url, key_b64, file_path, file_name):
     else:
         dec_content = content
 
-    with open(os.path.join(file_path, file_name), 'wb') as file:
-        file.write(dec_content)
+    target_full_path = os.path.join(file_path, file_name)
+    temp_full_path = target_full_path + '.tmp'
+    try:
+        with open(temp_full_path, 'wb') as file:
+            file.write(dec_content)
+        if os.path.exists(target_full_path):
+            try:
+                os.remove(target_full_path)
+            except OSError:
+                pass
+        os.replace(temp_full_path, target_full_path)
+    except Exception:
+        if os.path.exists(temp_full_path):
+            try:
+                os.remove(temp_full_path)
+            except OSError:
+                pass
+        raise
+    return len(dec_content)
 
 def probe_endpoint_get(params, endpoint):
     token, null, null, app_server_url_get = get_config()
@@ -319,8 +367,8 @@ def login(username, password, mfa_type, show_debug):
     result['tapoCareUrl'] = tapo_care_url(result)
 
     file_path = os.path.dirname(config_path())
-    if not os.path.exists(file_path): os.makedirs(file_path)
-    with open(config_path(), 'w+') as file:
+    os.makedirs(file_path, exist_ok=True)
+    with open(config_path(), 'w', encoding='utf-8') as file:
         file.write(json.dumps(result, indent = 4))
     print('Access token saved in ' + config_path())
 
@@ -459,84 +507,462 @@ def mfa_status():
     res = probe_endpoint_post(content, endpoint)
     print(json.dumps(res, indent = 4))
 
+def format_time_ago(event_local_time_str):
+    """Calculates days ago from today for display (e.g. '오늘', '1일 전', '30일 전 (D-30)')."""
+    try:
+        event_dt = datetime.datetime.strptime(event_local_time_str, '%Y-%m-%d %H:%M:%S')
+        today = datetime.datetime.now().date()
+        diff_days = (today - event_dt.date()).days
+        if diff_days <= 0:
+            return "오늘"
+        elif diff_days == 1:
+            return "1일 전"
+        else:
+            return f"{diff_days}일 전 (D-{diff_days})"
+    except Exception:
+        return "알 수 없음"
+
+def format_file_size(num_bytes):
+    """Formats bytes into human-readable MB / KB."""
+    if num_bytes >= 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+    elif num_bytes >= 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    else:
+        return f"{num_bytes} B"
+
+def iter_videos(device_id, start_time, end_time, order='asc'):
+    """Yields (total_count, current_index, video_item) in streaming pages from Tapo API."""
+    page = 0
+    page_size = 1000
+    endpoint = '/v2/videos/list'
+    yielded_count = 0
+    total = None
+
+    while True:
+        params = {
+            'deviceId': device_id,
+            'page': page,
+            'pageSize': page_size,
+            'order': order,
+            'startTime': start_time,
+            'endTime': end_time
+        }
+        res = probe_endpoint_get(params, endpoint)
+        if total is None:
+            total = res.get('total', 0)
+
+        items = res.get('index', [])
+        if not items:
+            break
+
+        for item in items:
+            yielded_count += 1
+            yield total, yielded_count, item
+
+        if yielded_count >= total:
+            break
+        page += 1
+
+def fetch_all_videos(device_id, start_time, end_time, order='asc'):
+    """Fetches all videos for a device between start_time and end_time, handling pagination."""
+    all_videos = []
+    total = 0
+    for tot, idx, video in iter_videos(device_id, start_time, end_time, order=order):
+        total = tot
+        all_videos.append(video)
+    return total, all_videos
+
+def filter_devices(devices, camera_query):
+    """Filters device list based on camera query (name/alias or device ID)."""
+    if not camera_query or camera_query.strip().lower() in ('all', ''):
+        return devices
+
+    selected_queries = [q.strip().lower() for q in camera_query.split(',') if q.strip()]
+    matched = []
+
+    for dev in devices:
+        alias = dev.get('alias', '').strip().lower()
+        dev_id = dev.get('deviceId', '').strip().lower()
+
+        for q in selected_queries:
+            if q == alias or q == dev_id or (len(q) >= 2 and q in alias):
+                if dev not in matched:
+                    matched.append(dev)
+                break
+
+    return matched
+
 @click.command()
-@click.option('--days', default=1, prompt="Last X days", help='Last X days which you want to list videos for.')
-def list_videos(days):
+@click.option('--days', default=1, type=int, help='Last X days which you want to list videos for (default: 1).')
+@click.option('--camera', '-c', default=None, help='Filter by camera name (alias) or device ID. Comma-separated for multiple, or "all".')
+def list_videos(days, camera):
     """Lists videos for the last X days."""
     get_config() # Checks if logged in
     endpoint = '/api/v2/common/getDeviceListByPage'
     content = '{"deviceTypeList":["SMART.IPCAMERA"],"index":0,"limit":20}'
     devs = probe_endpoint_post(content, endpoint)
+
+    device_list = filter_devices(devs.get('deviceList', []), camera)
+    if not device_list:
+        available = [d.get('alias', 'unknown') for d in devs.get('deviceList', [])]
+        print(f"No cameras matched '{camera}'. Available cameras: {', '.join(available)}")
+        return
     
     start_time, end_time = time_range(days)
 
-    endpoint = '/v2/videos/list'
-    total = 0
-    for dev in devs['deviceList']:
-        params = 'deviceId=' + dev['deviceId'] + '&page=0&pageSize=3000&order=desc&startTime=' + start_time + '&endTime=' + end_time
-        videos = probe_endpoint_get(params, endpoint)
-        total += videos.get('total', 0)
-        print('\nFound ' + str(videos.get('total', 0)) + ' videos for ' + dev['alias'] + ':')
-        for video in videos.get('index', []):
+    grand_total = 0
+    for dev in device_list:
+        total, videos = fetch_all_videos(dev['deviceId'], start_time, end_time, order='asc')
+        grand_total += total
+        print('\nFound ' + str(total) + ' videos for ' + dev['alias'] + ':')
+        if videos:
+            print(f"Available range: {videos[0]['eventLocalTime']} (earliest) ~ {videos[-1]['eventLocalTime']} (latest)")
+        for video in videos:
             print(video['eventLocalTime'], end = ", ")
-            #print(video['video'][0]['uri']) # This will print URLs to the videos if you want to download them using another tool, but don't forget to get the AES key from video['video'][0]['decryptionInfo']['key']
-        if videos.get('total', 0) > 0: print('')
+        if total > 0: print('')
 
-    if total == 0:
+    if grand_total == 0:
         null, null, null, app_server_url_get = get_config()
         no_videos_hint(app_server_url_get)
 
 @click.command()
-@click.option('--days', default=1, prompt="Last X days", help='Last X days which you want to download videos for.')
-@click.option('--path', default="~/", prompt="Path", help='Path where you want your videos to be downloaded. It will create directories based on dates.')
-@click.option('--overwrite', default=0, prompt="Overwrite", help='Overwrite any files using the same name in the same location.')
-def download_videos(days, path, overwrite):
-    """Downloads videos for the last X days to path."""
+@click.option('--days', default=1, type=int, help='Last X days which you want to download videos for (default: 1).')
+@click.option('--path', default="~/", help='Path where you want your videos to be downloaded (default: ~/ which creates subdirectories by camera/date).')
+@click.option('--overwrite', default=0, type=int, help='Overwrite files if already existing (default: 0 = skip duplicate/existing, 1 = overwrite).')
+@click.option('--camera', '-c', default=None, help='Filter by camera name (alias) or device ID. Comma-separated for multiple, or "all".')
+def download_videos(days, path, overwrite, camera):
+    """Downloads videos starting from the oldest available date with smart deduplication and live progress."""
     get_config() # Checks if logged in
     
-    path = os.path.join(os.path.expanduser(path), '')
+    base_dir = os.path.abspath(os.path.expanduser(path))
     
     endpoint = '/api/v2/common/getDeviceListByPage'
     content = '{"deviceTypeList":["SMART.IPCAMERA"],"index":0,"limit":20}'
     devs = probe_endpoint_post(content, endpoint)
+
+    device_list = filter_devices(devs.get('deviceList', []), camera)
+    if not device_list:
+        available = [d.get('alias', 'unknown') for d in devs.get('deviceList', [])]
+        print(f"No cameras matched '{camera}'. Available cameras: {', '.join(available)}")
+        return []
     
     start_time, end_time = time_range(days)
 
     result = []
-    endpoint = '/v2/videos/list'
-    for dev in devs['deviceList']:
-        params = 'deviceId=' + dev['deviceId'] + '&page=0&pageSize=3000&order=desc&startTime=' + start_time + '&endTime=' + end_time
-        videos = probe_endpoint_get(params, endpoint)
-        print('\nFound ' + str(videos.get('total', 0)) + ' videos for ' + dev['alias'] + ':')
-        for video in videos.get('index', []):
+    seen_video_uuids = set()
+
+    for dev in device_list:
+        device_alias = dev.get('alias', 'unknown')
+        device_folder = sanitize_filename(device_alias)
+        
+        print("\n" + "=" * 80)
+        print(f" ▶ 카메라: '{device_alias}' (가장 오래된 날짜부터 순차 다운로드 시작)")
+        print("=" * 80, flush=True)
+
+        downloaded_count = 0
+        skipped_count = 0
+        total_videos = 0
+
+        # Stream videos starting from oldest date (order='asc')
+        for total, current_idx, video in iter_videos(dev['deviceId'], start_time, end_time, order='asc'):
+            total_videos = total
+            video_time = video.get('eventLocalTime', '')
+            time_ago_str = format_time_ago(video_time)
+            pct = (current_idx / total * 100.0) if total > 0 else 0.0
+
+            progress_prefix = f"[{current_idx:>{len(str(total))}}/{total:,}] ({pct:>5.1f}%) [{time_ago_str}] {video_time}"
+
+            # 1. Deduplicate by video UUID within this session
+            video_uuid = video.get('uuid', '')
+            if video_uuid:
+                if video_uuid in seen_video_uuids:
+                    skipped_count += 1
+                    continue
+                seen_video_uuids.add(video_uuid)
+
             url = video['video'][0]['uri']
             key_b64 = False
 
-            # Check if the video is encrypted and get the key
             if 'encryptionMethod' in video['video'][0]:
                 method = video['video'][0]['encryptionMethod']
                 if method != "AES-128-CBC":
-                    print(f"Unsupported encryption method: {method}. Quitting...")
-                    print("Create an issue here: https://github.com/dimme/tapo-cli/issues")
+                    print(f"\n[오류] 지원되지 않는 암호화 방식: {method}")
                     exit(1)
-
                 key_b64 = video['video'][0]['decryptionInfo']['key']
 
-            file_path = path + dev['alias'] + '/' + datetime.datetime.strptime(video['eventLocalTime'], '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d') + '/'
-            file_name = video['eventLocalTime'].replace(':','-') + '.mp4'
-            if os.path.exists(file_path + file_name) and overwrite == 0:
-                print('Already exists ' + file_path + file_name)
-                result.append({'file': file_path + file_name, 'device': dev['alias'], 'new_video': False, 'video': video})
-            else:
-                print('Downloading to ' + file_path + file_name)
-                download(url, key_b64, file_path, file_name)
-                result.append({'file': file_path + file_name, 'device': dev['alias'], 'new_video': True, 'video': video})
+            date_folder = datetime.datetime.strptime(video_time, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
+            target_dir = os.path.join(base_dir, device_folder, date_folder)
+            file_name = video_time.replace(':', '-') + '.mp4'
+            full_path = os.path.join(target_dir, file_name)
+
+            # 2. Check duplicate / already exists
+            if os.path.exists(full_path) and overwrite == 0:
+                file_sz = os.path.getsize(full_path)
+                if file_sz > 0:
+                    print(f"{progress_prefix} -> [건너뜀] 이미 존재함 ({format_file_size(file_sz)})", flush=True)
+                    skipped_count += 1
+                    result.append({'file': full_path, 'device': device_alias, 'new_video': False, 'video': video})
+                    continue
+                else:
+                    try:
+                        os.remove(full_path)
+                    except OSError:
+                        pass
+
+            # 3. Download
+            print(f"{progress_prefix} -> [다운로드 중...] ", end="", flush=True)
+            bytes_saved = download(url, key_b64, target_dir, file_name)
+            print(f"완료 ({format_file_size(bytes_saved)})", flush=True)
+            downloaded_count += 1
+            result.append({'file': full_path, 'device': device_alias, 'new_video': True, 'video': video})
+
+        if total_videos == 0:
+            print(f"저장된 비디오가 없습니다.")
+        else:
+            print("\n" + "-" * 80)
+            print(f" ▶ '{device_alias}' 작업 완료 요약:")
+            print(f"   • 총 비디오 수    : {total_videos:,}개")
+            print(f"   • 신규 다운로드   : {downloaded_count:,}개")
+            print(f"   • 중복 건너뜀     : {skipped_count:,}개")
+            print("-" * 80 + "\n", flush=True)
 
     if not result:
         null, null, null, app_server_url_get = get_config()
         no_videos_hint(app_server_url_get)
 
     return result
+
+def parse_clip_timestamp(filename_or_path):
+    """Extracts start datetime from filename like '2026-09-05 09-48-35.mp4' or '2026-09-05 09-48-35_xxx.mp4'."""
+    basename = os.path.basename(filename_or_path)
+    match = re.search(r'(\d{4}-\d{2}-\d{2})[ _T](\d{2})[-:](\d{2})[-:](\d{2})', basename)
+    if match:
+        date_part = match.group(1)
+        h, m, s = match.group(2), match.group(3), match.group(4)
+        try:
+            return datetime.datetime.strptime(f"{date_part} {h}:{m}:{s}", '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return None
+    return None
+
+def get_video_duration(file_path):
+    """Gets video duration in seconds using ffprobe, or defaults to 60.0s if unavailable."""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            file_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            return float(res.stdout.strip())
+    except Exception:
+        pass
+    return 60.0
+
+def group_continuous_clips(clips, max_gap_seconds=60):
+    """Groups clips where the gap between consecutive clips is <= max_gap_seconds."""
+    if not clips:
+        return []
+
+    sorted_clips = sorted(clips, key=lambda c: c['start_time'])
+    groups = []
+    current_group = []
+
+    for clip in sorted_clips:
+        if not current_group:
+            current_group.append(clip)
+            continue
+
+        prev_clip = current_group[-1]
+        gap = (clip['start_time'] - prev_clip['end_time']).total_seconds()
+
+        # Allow slight overlap (-5s) up to max_gap_seconds
+        if -5.0 <= gap <= max_gap_seconds:
+            current_group.append(clip)
+        else:
+            groups.append(current_group)
+            current_group = [clip]
+
+    if current_group:
+        groups.append(current_group)
+
+    return groups
+
+def merge_clip_group_ffmpeg(clips, output_file):
+    """Merges a list of mp4 clips using ffmpeg concat demuxer without re-encoding."""
+    if not clips:
+        return False
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+        temp_list_path = f.name
+        for clip in clips:
+            safe_path = os.path.abspath(clip['path']).replace("'", "'\\''")
+            f.write(f"file '{safe_path}'\n")
+
+    try:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        temp_output = output_file + '.tmp.mp4'
+        cmd = [
+            'ffmpeg', '-y', '-v', 'error',
+            '-f', 'concat', '-safe', '0',
+            '-i', temp_list_path,
+            '-c', 'copy',
+            temp_output
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0 and os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+            if os.path.exists(output_file):
+                try:
+                    os.remove(output_file)
+                except OSError:
+                    pass
+            os.replace(temp_output, output_file)
+            return True
+        else:
+            if os.path.exists(temp_output):
+                try:
+                    os.remove(temp_output)
+                except OSError:
+                    pass
+            return False
+    finally:
+        if os.path.exists(temp_list_path):
+            try:
+                os.remove(temp_list_path)
+            except OSError:
+                pass
+
+@click.command()
+@click.option('--path', default="~/", help='Base directory where downloaded videos are stored (default: ~/).')
+@click.option('--camera', '-c', default=None, help='Filter by camera folder name (e.g. "정우방").')
+@click.option('--max-gap', default=60, type=int, help='Maximum gap in seconds between clips to be considered continuous (default: 60s).')
+@click.option('--output-dir', default=None, help='Custom output directory for merged videos (default: creates "merged" subfolder).')
+@click.option('--delete-source', is_flag=True, default=False, help='Delete original fragmented clips after successful merge.')
+def merge_videos(path, camera, max_gap, output_dir, delete_source):
+    """Merges continuous CCTV clips if the time gap between them is <= max-gap seconds."""
+    base_dir = os.path.abspath(os.path.expanduser(path))
+    if not os.path.exists(base_dir):
+        print(f"[오류] 지정한 경로를 찾을 수 없습니다: {base_dir}")
+        return
+
+    # Check ffmpeg availability
+    try:
+        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception:
+        print("[오류] ffmpeg가 설치되어 있지 않거나 PATH에 등록되어 있지 않습니다.")
+        print("ffmpeg를 설치해주세요 (Windows: 'scoop install ffmpeg' 또는 'winget install Gyan.FFmpeg').")
+        return
+
+    # Find camera directories
+    camera_dirs = []
+    for item in os.listdir(base_dir):
+        item_path = os.path.join(base_dir, item)
+        if os.path.isdir(item_path) and item.lower() != 'merged':
+            if not camera or camera.lower() in item.lower():
+                camera_dirs.append((item, item_path))
+
+    if not camera_dirs:
+        print(f"'{base_dir}'에서 비디오가 저장된 카메라 폴더를 찾을 수 없습니다.")
+        return
+
+    print("\n" + "=" * 80)
+    print(f" [연속 CCTV 비디오 병합 작업 시작]")
+    print(f" • 기준 경로 : {base_dir}")
+    print(f" • 최대 연속 간격 : {max_gap}초 이하 (설정 간격 이하 시 이어붙임)")
+    print("=" * 80)
+
+    total_merged_groups = 0
+    total_clips_merged = 0
+
+    for cam_name, cam_path in camera_dirs:
+        print(f"\n▶ 카메라: '{cam_name}' 탐색 중...")
+        
+        # Scan date folders (e.g. 2026-09-05)
+        date_dirs = [d for d in os.listdir(cam_path) if os.path.isdir(os.path.join(cam_path, d)) and d.lower() != 'merged']
+        date_dirs.sort()
+
+        cam_merged_count = 0
+        cam_clips_count = 0
+
+        for date_str in date_dirs:
+            date_path = os.path.join(cam_path, date_str)
+            files = [f for f in os.listdir(date_path) if f.lower().endswith('.mp4') and not f.endswith('.tmp.mp4')]
+            
+            clips = []
+            for f in files:
+                f_path = os.path.join(date_path, f)
+                ts = parse_clip_timestamp(f)
+                if ts:
+                    dur = get_video_duration(f_path)
+                    clips.append({
+                        'path': f_path,
+                        'filename': f,
+                        'start_time': ts,
+                        'duration': dur,
+                        'end_time': ts + datetime.timedelta(seconds=dur)
+                    })
+
+            if not clips:
+                continue
+
+            groups = group_continuous_clips(clips, max_gap_seconds=max_gap)
+
+            for group in groups:
+                if len(group) < 2:
+                    # Single isolated clip, no need to merge
+                    continue
+
+                first_clip = group[0]
+                last_clip = group[-1]
+                start_str = first_clip['start_time'].strftime('%Y-%m-%d %H-%M-%S')
+                end_time_str = last_clip['end_time'].strftime('%H-%M-%S')
+                total_duration_sec = sum(c['duration'] for c in group)
+                total_min = int(total_duration_sec // 60)
+                total_sec = int(total_duration_sec % 60)
+
+                # Output directory
+                if output_dir:
+                    out_date_dir = os.path.join(os.path.abspath(os.path.expanduser(output_dir)), cam_name, date_str)
+                else:
+                    out_date_dir = os.path.join(cam_path, 'merged', date_str)
+
+                merged_filename = f"{start_str}_to_{end_time_str} ({len(group)}clips, {total_min}m{total_sec}s).mp4"
+                merged_output_path = os.path.join(out_date_dir, merged_filename)
+
+                # Check if already merged
+                if os.path.exists(merged_output_path) and os.path.getsize(merged_output_path) > 0:
+                    print(f"  [이미 병합됨] {date_str} {start_str} ~ {end_time_str} ({len(group)}개 클립)")
+                    continue
+
+                print(f"  [병합 중] {date_str} {start_str} ~ {end_time_str} ({len(group)}개 클립, {total_min}분 {total_sec}초)... ", end="", flush=True)
+                success = merge_clip_group_ffmpeg(group, merged_output_path)
+                if success:
+                    merged_size = os.path.getsize(merged_output_path)
+                    print(f"완료 ({format_file_size(merged_size)})", flush=True)
+                    cam_merged_count += 1
+                    cam_clips_count += len(group)
+
+                    if delete_source:
+                        for c in group:
+                            try:
+                                os.remove(c['path'])
+                            except OSError:
+                                pass
+                else:
+                    print("실패", flush=True)
+
+        total_merged_groups += cam_merged_count
+        total_clips_merged += cam_clips_count
+        print(f"  >> '{cam_name}' 병합 결과: {cam_merged_count}개 연속 영상 생성 (총 {cam_clips_count}개 클립 병합)")
+
+    print("\n" + "=" * 80)
+    print(f" [전체 병합 작업 완료]")
+    print(f" • 새로 생성된 연속 비디오 : {total_merged_groups:,}개")
+    print(f" • 병합된 총 원본 클립 수 : {total_clips_merged:,}개")
+    print("=" * 80 + "\n")
 
 tapo.add_command(login, 'login')
 tapo.add_command(probe_mfa, 'probe-mfa')
@@ -550,6 +976,7 @@ tapo.add_command(subscriptions, 'list-subscriptions')
 tapo.add_command(mfa_status, 'list-mfa-status')
 tapo.add_command(list_videos, 'list-videos')
 tapo.add_command(download_videos, 'download-videos')
+tapo.add_command(merge_videos, 'merge-videos')
 
 if __name__ == '__main__':
     tapo()
