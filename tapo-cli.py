@@ -729,12 +729,19 @@ def download_videos(days, path, overwrite, camera):
             url = video['video'][0]['uri']
             key_b64 = False
 
-            if 'encryptionMethod' in video['video'][0]:
-                method = video['video'][0]['encryptionMethod']
-                if method != "AES-128-CBC":
-                    print(f"\n[오류] 지원되지 않는 암호화 방식: {method}")
-                    exit(1)
-                key_b64 = video['video'][0]['decryptionInfo']['key']
+            enc_method = video['video'][0].get('encryptionMethod')
+            if enc_method and str(enc_method).strip().upper() not in ("NONE", ""):
+                if enc_method == "AES-128-CBC":
+                    dec_info = video['video'][0].get('decryptionInfo') or {}
+                    key_b64 = dec_info.get('key')
+                    if not key_b64:
+                        print(f"\n[경고] 복호화 키가 없어 비디오 건너뜀: {video_time}", flush=True)
+                        skipped_count += 1
+                        continue
+                else:
+                    print(f"\n[경고] 지원되지 않는 암호화 방식({enc_method}) 비디오 건너뜀: {video_time}", flush=True)
+                    skipped_count += 1
+                    continue
 
             date_folder = datetime.datetime.strptime(video_time, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
             target_dir = os.path.join(base_dir, device_folder, date_folder)
@@ -757,10 +764,15 @@ def download_videos(days, path, overwrite, camera):
 
             # 3. Download
             print(f"{progress_prefix} -> [다운로드 중...] ", end="", flush=True)
-            bytes_saved = download(url, key_b64, target_dir, file_name)
-            print(f"완료 ({format_file_size(bytes_saved)})", flush=True)
-            downloaded_count += 1
-            result.append({'file': full_path, 'device': device_alias, 'new_video': True, 'video': video})
+            try:
+                bytes_saved = download(url, key_b64, target_dir, file_name)
+                print(f"완료 ({format_file_size(bytes_saved)})", flush=True)
+                downloaded_count += 1
+                result.append({'file': full_path, 'device': device_alias, 'new_video': True, 'video': video})
+            except Exception as e:
+                print(f"실패 ({e})", flush=True)
+                skipped_count += 1
+                continue
 
         if total_videos == 0:
             print(f"저장된 비디오가 없습니다.")

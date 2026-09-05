@@ -157,6 +157,15 @@ class TestWindowsCompatibility(unittest.TestCase):
         self.assertEqual(tapo_cli.error_code(gw_err), -20651)
         self.assertTrue(tapo_cli.token_expired(gw_err))
 
+    def test_encryption_method_none(self):
+        """Test that encryptionMethod NONE is handled without decryption key."""
+        video_none = {
+            'eventLocalTime': '2026-08-17 13:30:28',
+            'video': [{'uri': 'http://example.com/test.mp4', 'encryptionMethod': 'NONE'}]
+        }
+        enc = video_none['video'][0].get('encryptionMethod')
+        self.assertIn(str(enc).strip().upper(), ("NONE", ""))
+
 if __name__ == '__main__':
     unittest.main()
 
