@@ -139,6 +139,9 @@ class TestWindowsCompatibility(unittest.TestCase):
             self.assertEqual(res.exit_code, 0, f"Command {cmd} --help failed")
             self.assertIn("--camera", res.output)
 
+        res_dl = runner.invoke(tapo_cli.tapo, ['download-videos', '--help'])
+        self.assertIn("--concurrency", res_dl.output)
+
     def test_error_code_and_token_expired(self):
         """Test error_code and token_expired detection for Tapo Care API responses."""
         # Success response
@@ -165,6 +168,28 @@ class TestWindowsCompatibility(unittest.TestCase):
         }
         enc = video_none['video'][0].get('encryptionMethod')
         self.assertIn(str(enc).strip().upper(), ("NONE", ""))
+
+    def test_download_task_worker(self):
+        """Test that _download_task_worker downloads and reports status safely."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task = {
+                'url': 'http://example.com/clip.mp4',
+                'key_b64': False,
+                'target_dir': tmpdir,
+                'file_name': 'clip.mp4',
+                'full_path': os.path.join(tmpdir, 'clip.mp4'),
+                'progress_prefix': '[1/1]',
+                'video': {'eventLocalTime': '2026-08-17 13:30:28'},
+                'device_alias': 'TestCam'
+            }
+            mock_res = MagicMock()
+            mock_res.content = b'test-clip-content'
+            with patch('requests.get', return_value=mock_res):
+                res = tapo_cli._download_task_worker(task, is_parallel=True)
+                self.assertTrue(res['success'])
+                self.assertTrue(os.path.exists(task['full_path']))
+                with open(task['full_path'], 'rb') as f:
+                    self.assertEqual(f.read(), b'test-clip-content')
 
 if __name__ == '__main__':
     unittest.main()

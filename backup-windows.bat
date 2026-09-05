@@ -14,6 +14,9 @@ set "DAYS=7"
 rem Overwrite existing files (0 = skip existing duplicates, 1 = overwrite)
 set "OVERWRITE=0"
 
+rem Concurrent download threads (default: 8)
+set "CONCURRENCY=8"
+
 rem Optional: specific camera(s) to backup (leave blank or 'all' for all cameras)
 rem Examples: set "CAMERA=정우방" or set "CAMERA=정우방,정우"
 set "CAMERA="
@@ -34,9 +37,9 @@ echo Saving videos to: %BACKUP_DIR%
 
 if defined CAMERA (
     echo Target camera(s): %CAMERA%
-    "%PYTHON_EXE%" "%SCRIPT_DIR%tapo-cli.py" download-videos --days %DAYS% --path "%BACKUP_DIR%" --overwrite %OVERWRITE% --camera "%CAMERA%"
+    "%PYTHON_EXE%" "%SCRIPT_DIR%tapo-cli.py" download-videos --days %DAYS% --path "%BACKUP_DIR%" --overwrite %OVERWRITE% --camera "%CAMERA%" --concurrency %CONCURRENCY%
 ) else (
-    "%PYTHON_EXE%" "%SCRIPT_DIR%tapo-cli.py" download-videos --days %DAYS% --path "%BACKUP_DIR%" --overwrite %OVERWRITE%
+    "%PYTHON_EXE%" "%SCRIPT_DIR%tapo-cli.py" download-videos --days %DAYS% --path "%BACKUP_DIR%" --overwrite %OVERWRITE% --concurrency %CONCURRENCY%
 )
 
 set "EXIT_CODE=%ERRORLEVEL%"

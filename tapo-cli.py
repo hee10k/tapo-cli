@@ -11,6 +11,8 @@ import os
 import sys
 import subprocess
 import tempfile
+import threading
+import concurrent.futures
 import click
 import requests
 import urllib3
@@ -24,6 +26,9 @@ import re
 import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
+
+# Thread-safe console lock for parallel downloads
+console_lock = threading.Lock()
 
 # Ensure UTF-8 output on Windows consoles to prevent cp949 / charmap UnicodeEncodeErrors
 if sys.platform == 'win32':
@@ -199,7 +204,7 @@ def download(url, key_b64, file_path, file_name):
         dec_content = content
 
     target_full_path = os.path.join(file_path, file_name)
-    temp_full_path = target_full_path + '.tmp'
+    temp_full_path = target_full_path + f'.tmp.{uuid.uuid4().hex[:8]}'
     try:
         with open(temp_full_path, 'wb') as file:
             file.write(dec_content)
@@ -671,15 +676,46 @@ def list_videos(days, camera):
         null, null, null, app_server_url_get = get_config()
         no_videos_hint(app_server_url_get)
 
+def _download_task_worker(task, is_parallel=True):
+    """Worker function for concurrent downloads."""
+    url = task['url']
+    key_b64 = task['key_b64']
+    target_dir = task['target_dir']
+    file_name = task['file_name']
+    full_path = task['full_path']
+    progress_prefix = task['progress_prefix']
+    video = task['video']
+    device_alias = task['device_alias']
+
+    try:
+        bytes_saved = download(url, key_b64, target_dir, file_name)
+        with console_lock:
+            if is_parallel:
+                print(f"{progress_prefix} -> [다운로드 완료] ({format_file_size(bytes_saved)})", flush=True)
+            else:
+                print(f"완료 ({format_file_size(bytes_saved)})", flush=True)
+        return {'file': full_path, 'device': device_alias, 'new_video': True, 'success': True, 'video': video}
+    except Exception as e:
+        with console_lock:
+            if is_parallel:
+                print(f"{progress_prefix} -> [다운로드 실패] ({e})", flush=True)
+            else:
+                print(f"실패 ({e})", flush=True)
+        return {'file': full_path, 'device': device_alias, 'new_video': False, 'success': False, 'error': str(e), 'video': video}
+
 @click.command()
 @click.option('--days', default=1, type=int, help='Last X days which you want to download videos for (default: 1).')
 @click.option('--path', default="~/", help='Path where you want your videos to be downloaded (default: ~/ which creates subdirectories by camera/date).')
 @click.option('--overwrite', default=0, type=int, help='Overwrite files if already existing (default: 0 = skip duplicate/existing, 1 = overwrite).')
 @click.option('--camera', '-c', default=None, help='Filter by camera name (alias) or device ID. Comma-separated for multiple, or "all".')
-def download_videos(days, path, overwrite, camera):
-    """Downloads videos starting from the oldest available date with smart deduplication and live progress."""
+@click.option('--concurrency', '-w', default=8, type=int, help='Number of concurrent download threads (default: 8).')
+def download_videos(days, path, overwrite, camera, concurrency):
+    """Downloads videos starting from the oldest available date with smart deduplication, parallel downloads, and live progress."""
     get_config() # Checks if logged in
     
+    if concurrency < 1:
+        concurrency = 1
+
     base_dir = os.path.abspath(os.path.expanduser(path))
     
     endpoint = '/api/v2/common/getDeviceListByPage'
@@ -702,77 +738,125 @@ def download_videos(days, path, overwrite, camera):
         device_folder = sanitize_filename(device_alias)
         
         print("\n" + "=" * 80)
-        print(f" ▶ 카메라: '{device_alias}' (가장 오래된 날짜부터 순차 다운로드 시작)")
+        print(f" ▶ 카메라: '{device_alias}' (동시 다운로드 스레드: {concurrency}개)")
         print("=" * 80, flush=True)
 
         downloaded_count = 0
         skipped_count = 0
         total_videos = 0
+        active_futures = set()
+        max_in_flight = max(concurrency * 4, 16)
 
-        # Stream videos starting from oldest date (order='asc')
-        for total, current_idx, video in iter_videos(dev['deviceId'], start_time, end_time, order='asc'):
-            total_videos = total
-            video_time = video.get('eventLocalTime', '')
-            time_ago_str = format_time_ago(video_time)
-            pct = (current_idx / total * 100.0) if total > 0 else 0.0
+        is_parallel = concurrency > 1
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) if is_parallel else None
 
-            progress_prefix = f"[{current_idx:>{len(str(total))}}/{total:,}] ({pct:>5.1f}%) [{time_ago_str}] {video_time}"
+        try:
+            # Stream videos starting from oldest date (order='asc')
+            for total, current_idx, video in iter_videos(dev['deviceId'], start_time, end_time, order='asc'):
+                total_videos = total
+                video_time = video.get('eventLocalTime', '')
+                time_ago_str = format_time_ago(video_time)
+                pct = (current_idx / total * 100.0) if total > 0 else 0.0
 
-            # 1. Deduplicate by video UUID within this session
-            video_uuid = video.get('uuid', '')
-            if video_uuid:
-                if video_uuid in seen_video_uuids:
-                    skipped_count += 1
-                    continue
-                seen_video_uuids.add(video_uuid)
+                progress_prefix = f"[{current_idx:>{len(str(total))}}/{total:,}] ({pct:>5.1f}%) [{time_ago_str}] {video_time}"
 
-            url = video['video'][0]['uri']
-            key_b64 = False
-
-            enc_method = video['video'][0].get('encryptionMethod')
-            if enc_method and str(enc_method).strip().upper() not in ("NONE", ""):
-                if enc_method == "AES-128-CBC":
-                    dec_info = video['video'][0].get('decryptionInfo') or {}
-                    key_b64 = dec_info.get('key')
-                    if not key_b64:
-                        print(f"\n[경고] 복호화 키가 없어 비디오 건너뜀: {video_time}", flush=True)
+                # 1. Deduplicate by video UUID within this session
+                video_uuid = video.get('uuid', '')
+                if video_uuid:
+                    if video_uuid in seen_video_uuids:
                         skipped_count += 1
                         continue
+                    seen_video_uuids.add(video_uuid)
+
+                url = video['video'][0]['uri']
+                key_b64 = False
+
+                enc_method = video['video'][0].get('encryptionMethod')
+                if enc_method and str(enc_method).strip().upper() not in ("NONE", ""):
+                    if enc_method == "AES-128-CBC":
+                        dec_info = video['video'][0].get('decryptionInfo') or {}
+                        key_b64 = dec_info.get('key')
+                        if not key_b64:
+                            with console_lock:
+                                print(f"\n[경고] 복호화 키가 없어 비디오 건너뜀: {video_time}", flush=True)
+                            skipped_count += 1
+                            continue
+                    else:
+                        with console_lock:
+                            print(f"\n[경고] 지원되지 않는 암호화 방식({enc_method}) 비디오 건너뜀: {video_time}", flush=True)
+                        skipped_count += 1
+                        continue
+
+                date_folder = datetime.datetime.strptime(video_time, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
+                target_dir = os.path.join(base_dir, device_folder, date_folder)
+                file_name = video_time.replace(':', '-') + '.mp4'
+                full_path = os.path.join(target_dir, file_name)
+
+                # 2. Check duplicate / already exists (Pre-check before submitting to pool)
+                if os.path.exists(full_path) and overwrite == 0:
+                    file_sz = os.path.getsize(full_path)
+                    if file_sz > 0:
+                        with console_lock:
+                            print(f"{progress_prefix} -> [건너뜀] 이미 존재함 ({format_file_size(file_sz)})", flush=True)
+                        skipped_count += 1
+                        result.append({'file': full_path, 'device': device_alias, 'new_video': False, 'video': video})
+                        continue
+                    else:
+                        try:
+                            os.remove(full_path)
+                        except OSError:
+                            pass
+
+                # 3. Download (submit to thread pool or execute synchronously)
+                task = {
+                    'url': url,
+                    'key_b64': key_b64,
+                    'target_dir': target_dir,
+                    'file_name': file_name,
+                    'full_path': full_path,
+                    'progress_prefix': progress_prefix,
+                    'video': video,
+                    'device_alias': device_alias
+                }
+
+                if is_parallel:
+                    fut = executor.submit(_download_task_worker, task, True)
+                    active_futures.add(fut)
+
+                    # Drain finished tasks if we reach max in-flight
+                    if len(active_futures) >= max_in_flight:
+                        done, active_futures = concurrent.futures.wait(
+                            active_futures, return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                        for f in done:
+                            res_item = f.result()
+                            if res_item.get('success'):
+                                downloaded_count += 1
+                                result.append(res_item)
+                            else:
+                                skipped_count += 1
                 else:
-                    print(f"\n[경고] 지원되지 않는 암호화 방식({enc_method}) 비디오 건너뜀: {video_time}", flush=True)
-                    skipped_count += 1
-                    continue
+                    with console_lock:
+                        print(f"{progress_prefix} -> [다운로드 중...] ", end="", flush=True)
+                    res_item = _download_task_worker(task, False)
+                    if res_item.get('success'):
+                        downloaded_count += 1
+                        result.append(res_item)
+                    else:
+                        skipped_count += 1
 
-            date_folder = datetime.datetime.strptime(video_time, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
-            target_dir = os.path.join(base_dir, device_folder, date_folder)
-            file_name = video_time.replace(':', '-') + '.mp4'
-            full_path = os.path.join(target_dir, file_name)
-
-            # 2. Check duplicate / already exists
-            if os.path.exists(full_path) and overwrite == 0:
-                file_sz = os.path.getsize(full_path)
-                if file_sz > 0:
-                    print(f"{progress_prefix} -> [건너뜀] 이미 존재함 ({format_file_size(file_sz)})", flush=True)
-                    skipped_count += 1
-                    result.append({'file': full_path, 'device': device_alias, 'new_video': False, 'video': video})
-                    continue
-                else:
-                    try:
-                        os.remove(full_path)
-                    except OSError:
-                        pass
-
-            # 3. Download
-            print(f"{progress_prefix} -> [다운로드 중...] ", end="", flush=True)
-            try:
-                bytes_saved = download(url, key_b64, target_dir, file_name)
-                print(f"완료 ({format_file_size(bytes_saved)})", flush=True)
-                downloaded_count += 1
-                result.append({'file': full_path, 'device': device_alias, 'new_video': True, 'video': video})
-            except Exception as e:
-                print(f"실패 ({e})", flush=True)
-                skipped_count += 1
-                continue
+            # Drain any remaining parallel tasks
+            if is_parallel and active_futures:
+                for f in concurrent.futures.as_completed(active_futures):
+                    res_item = f.result()
+                    if res_item.get('success'):
+                        downloaded_count += 1
+                        result.append(res_item)
+                    else:
+                        skipped_count += 1
+        finally:
+            if executor:
+                executor.shutdown(wait=True)
 
         if total_videos == 0:
             print(f"저장된 비디오가 없습니다.")

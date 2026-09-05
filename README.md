@@ -9,6 +9,7 @@ Supports **Windows**, **Linux**, and **macOS** with native path resolution, char
 ## Key Features
 
 - **Sequential Oldest-First Streaming**: Downloads start immediately with the oldest recorded video without waiting to fetch the entire catalog.
+- **High-Speed Parallel Downloads**: Download multiple videos concurrently with multithreading (`--concurrency 8` / `-w 8` by default) to dramatically accelerate bulk backups (5x~10x faster).
 - **Camera Selection & Filtering**: Target one or more specific cameras (`--camera "정우방"` or `--camera "Cam1,Cam2"`).
 - **Real-Time Progress Display**: View ongoing progress with `[current/total] (progress%) [D-day] [timestamp] [filesize] -> filename`.
 - **Smart Deduplication**: Automatically skips already downloaded files and repairs corrupted/empty (0-byte) downloads.
@@ -92,8 +93,11 @@ tapo list-videos --days 30
 Downloads start from the **oldest video first** and stream sequentially with live progress:
 
 ```powershell
-# Download from a specific camera (e.g., "정우방") for the past 60 days
+# High-speed parallel download with 8 threads (default)
 tapo download-videos --camera "정우방" --days 60 --path "C:\TapoBackups"
+
+# Custom concurrency (e.g. 16 threads for ultra-fast downloads)
+tapo download-videos --camera "정우방" --days 60 --path "C:\TapoBackups" --concurrency 16
 
 # Download from multiple cameras (comma-separated)
 tapo download-videos --camera "정우방,정우" --days 30 --path "C:\TapoBackups"
@@ -109,9 +113,9 @@ Found 1 camera(s):
 
 [1/1] Processing camera: 정우방 (xxxxxxxx)
 ======================================================================
-  [1/12080] (  0.0%) [D-30] [2026-08-06 19:11:00] [14.2 MB] -> 2026-08-06_19-11-00.mp4
-  [2/12080] (  0.0%) [D-30] [2026-08-06 19:14:15] [ 8.5 MB] -> 2026-08-06_19-14-15.mp4
-  [3/12080] (  0.0%) [D-30] [2026-08-06 19:15:20] [12.1 MB] (Skipped: already downloaded)
+  [ 4262/12165] ( 35.0%) [19일 전 (D-19)] 2026-08-17 13:30:28 -> [건너뜀] 이미 존재함 (1.5 MB)
+  [ 4263/12165] ( 35.0%) [19일 전 (D-19)] 2026-08-17 13:31:10 -> [다운로드 완료] (2.4 MB)
+  [ 4264/12165] ( 35.0%) [19일 전 (D-19)] 2026-08-17 13:32:05 -> [다운로드 완료] (1.8 MB)
 ======================================================================
 ```
 
@@ -122,6 +126,7 @@ Found 1 camera(s):
 | `--days` | `-d` | Number of past days to query | `7` |
 | `--path` | `-p` | Destination directory | User home (`~/`) |
 | `--overwrite` | `-o` | `0` = skip existing valid files, `1` = force re-download | `0` |
+| `--concurrency` | `-w` | Number of parallel download worker threads | `8` |
 
 ---
 
