@@ -946,7 +946,7 @@ def group_continuous_clips(clips, max_gap_seconds=60):
 def merge_clip_group_ffmpeg(clips, output_file):
     """Merges a list of mp4 clips using ffmpeg concat demuxer without re-encoding."""
     if not clips:
-        return False
+        return False, "빈 클립 목록"
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
         temp_list_path = f.name
@@ -956,15 +956,16 @@ def merge_clip_group_ffmpeg(clips, output_file):
 
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        temp_output = output_file + '.tmp.mp4'
+        temp_output = output_file + f'.tmp.{uuid.uuid4().hex[:8]}.mp4'
         cmd = [
             'ffmpeg', '-y', '-v', 'error',
             '-f', 'concat', '-safe', '0',
             '-i', temp_list_path,
             '-c', 'copy',
+            '-strict', '-1',
             temp_output
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         if res.returncode == 0 and os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
             if os.path.exists(output_file):
                 try:
@@ -972,14 +973,15 @@ def merge_clip_group_ffmpeg(clips, output_file):
                 except OSError:
                     pass
             os.replace(temp_output, output_file)
-            return True
+            return True, ""
         else:
+            err = res.stderr.strip() if res.stderr else f"종료 코드 {res.returncode}"
             if os.path.exists(temp_output):
                 try:
                     os.remove(temp_output)
                 except OSError:
                     pass
-            return False
+            return False, err
     finally:
         if os.path.exists(temp_list_path):
             try:
@@ -1090,7 +1092,7 @@ def merge_videos(path, camera, max_gap, output_dir, delete_source):
                     continue
 
                 print(f"  [병합 중] {date_str} {start_str} ~ {end_time_str} ({len(group)}개 클립, {total_min}분 {total_sec}초)... ", end="", flush=True)
-                success = merge_clip_group_ffmpeg(group, merged_output_path)
+                success, err_msg = merge_clip_group_ffmpeg(group, merged_output_path)
                 if success:
                     merged_size = os.path.getsize(merged_output_path)
                     print(f"완료 ({format_file_size(merged_size)})", flush=True)
@@ -1104,7 +1106,7 @@ def merge_videos(path, camera, max_gap, output_dir, delete_source):
                             except OSError:
                                 pass
                 else:
-                    print("실패", flush=True)
+                    print(f"실패 ({err_msg})", flush=True)
 
         total_merged_groups += cam_merged_count
         total_clips_merged += cam_clips_count
