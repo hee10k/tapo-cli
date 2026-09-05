@@ -17,7 +17,7 @@ set "OVERWRITE=0"
 rem Concurrent download threads (default: 8)
 set "CONCURRENCY=8"
 
-rem Optional: specific camera(s) to backup (leave blank or 'all' for all cameras)
+rem Optional: specific camera to backup (leave blank or 'all' for all cameras)
 rem Examples: set "CAMERA=정우방" or set "CAMERA=정우방,정우"
 set "CAMERA="
 rem =====================
@@ -36,7 +36,7 @@ echo [%DATE% %TIME%] Starting Tapo video backup...
 echo Saving videos to: %BACKUP_DIR%
 
 if defined CAMERA (
-    echo Target camera(s): %CAMERA%
+    echo Target camera: %CAMERA%
     "%PYTHON_EXE%" "%SCRIPT_DIR%tapo-cli.py" download-videos --days %DAYS% --path "%BACKUP_DIR%" --overwrite %OVERWRITE% --camera "%CAMERA%" --concurrency %CONCURRENCY%
 ) else (
     "%PYTHON_EXE%" "%SCRIPT_DIR%tapo-cli.py" download-videos --days %DAYS% --path "%BACKUP_DIR%" --overwrite %OVERWRITE% --concurrency %CONCURRENCY%
