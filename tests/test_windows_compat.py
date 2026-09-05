@@ -139,5 +139,24 @@ class TestWindowsCompatibility(unittest.TestCase):
             self.assertEqual(res.exit_code, 0, f"Command {cmd} --help failed")
             self.assertIn("--camera", res.output)
 
+    def test_error_code_and_token_expired(self):
+        """Test error_code and token_expired detection for Tapo Care API responses."""
+        # Success response
+        self.assertEqual(tapo_cli.error_code({'error_code': 0}), 0)
+        self.assertEqual(tapo_cli.error_code({'errorCode': '0'}), 0)
+        self.assertEqual(tapo_cli.error_code({'code': 0}), 0)
+        self.assertFalse(tapo_cli.token_expired({'code': 0}))
+
+        # Tapo Care token expired (code 15000)
+        care_err = {'code': 15000, 'message': 'token invalid, expired or replaced'}
+        self.assertEqual(tapo_cli.error_code(care_err), 15000)
+        self.assertTrue(tapo_cli.token_expired(care_err))
+
+        # Gateway token expired (-20651)
+        gw_err = {'error_code': -20651, 'msg': 'Token expired'}
+        self.assertEqual(tapo_cli.error_code(gw_err), -20651)
+        self.assertTrue(tapo_cli.token_expired(gw_err))
+
 if __name__ == '__main__':
     unittest.main()
+

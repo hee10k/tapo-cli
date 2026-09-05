@@ -120,11 +120,11 @@ def get_config():
             config.get('tapoCareUrl') or tapo_care_url(config))
 
 # The app gateway calls it error_code, the account endpoints call it errorCode
-# and send it as a string. Returns 0 when Tapo is happy.
+# and send it as a string. Tapo Care uses code. Returns 0 when Tapo is happy.
 def error_code(obj):
     if not isinstance(obj, dict):
         return 0
-    for key in ('error_code', 'errorCode'):
+    for key in ('error_code', 'errorCode', 'code'):
         if key in obj:
             try:
                 return int(obj[key])
@@ -136,16 +136,18 @@ def error_code(obj):
 def token_expired(obj):
     if not isinstance(obj, dict):
         return False
-    if error_code(obj) == -20651:
+    if error_code(obj) in (-20651, 15000):
         return True
-    return 'token' in (str(obj.get('msg', '')) + ' ' + str(obj.get('errorMsg', ''))).lower()
+    msg_str = (str(obj.get('msg', '')) + ' ' + str(obj.get('errorMsg', '')) + ' ' + str(obj.get('message', ''))).lower()
+    return 'token' in msg_str and ('expire' in msg_str or 'invalid' in msg_str or 'replace' in msg_str)
 
 # Print and die when we get an error from Tapo
 def error(obj):
-    print('Something went wrong:')
+    print('\n[오류] Tapo 서버 요청 실패:')
     print(json.dumps(obj, indent = 4) if isinstance(obj, (dict, list)) else obj)
     if token_expired(obj):
-        print('\nYour access token is no longer valid. Run "tapo-cli.py login" to get a new one.')
+        print('\n[안내] 액세스 토큰이 만료되었습니다. "tapo login" (또는 "python tapo-cli.py login")을 실행하여 다시 로그인해주세요.')
+        print('      로그인 후 다시 다운로드를 실행하시면 이미 다운로드된 영상은 자동으로 건너뛰고 이어서 다운로드됩니다.')
     exit(1)
 
 # Headers that the Android app is using with GET endpoints in general.
@@ -166,7 +168,15 @@ def headers_post(content, endpoint):
 
 # GET with my own settings (e.g. with Burp Proxy for debugging)
 def get(url, params, headers):
-    return json.loads(requests.get(url, params = params, headers = headers, verify = False).text)
+    resp = requests.get(url, params = params, headers = headers, verify = False)
+    try:
+        data = json.loads(resp.text)
+        if isinstance(data, dict):
+            if resp.status_code != 200 and 'error_code' not in data and 'errorCode' not in data and 'code' not in data:
+                data['code'] = resp.status_code
+        return data
+    except Exception:
+        return {'code': resp.status_code, 'message': resp.text}
 
 # POST with my own settings (e.g. with Burp Proxy for debugging)
 def post(url, data, headers):
@@ -538,6 +548,7 @@ def iter_videos(device_id, start_time, end_time, order='asc'):
     endpoint = '/v2/videos/list'
     yielded_count = 0
     total = None
+    max_retries = 3
 
     while True:
         params = {
@@ -548,13 +559,47 @@ def iter_videos(device_id, start_time, end_time, order='asc'):
             'startTime': start_time,
             'endTime': end_time
         }
-        res = probe_endpoint_get(params, endpoint)
+        
+        # Retry logic for transient network glitches
+        res = None
+        for retry in range(max_retries):
+            try:
+                res = probe_endpoint_get(params, endpoint)
+                break
+            except SystemExit:
+                raise
+            except Exception as e:
+                if retry < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                raise
+
         if total is None:
             total = res.get('total', 0)
 
         items = res.get('index', [])
         if not items:
-            break
+            # If we still haven't reached total videos, retry a few times before giving up
+            if total and yielded_count < total:
+                retried = False
+                for retry in range(max_retries):
+                    time.sleep(3)
+                    try:
+                        res = probe_endpoint_get(params, endpoint)
+                        items = res.get('index', [])
+                        if items:
+                            retried = True
+                            break
+                    except SystemExit:
+                        raise
+                    except Exception:
+                        pass
+                if not retried:
+                    print(f"\n[경고] 서버에서 {page}번째 페이지(누적 {yielded_count:,}/{total:,}개)의 비디오 목록을 빈 값으로 반환하여 페이지네이션이 중단되었습니다.")
+                    print(f"       서버 응답: {res}")
+                    break
+            else:
+                break
 
         for item in items:
             yielded_count += 1
@@ -720,11 +765,22 @@ def download_videos(days, path, overwrite, camera):
         if total_videos == 0:
             print(f"저장된 비디오가 없습니다.")
         else:
+            is_incomplete = (downloaded_count + skipped_count) < total_videos
             print("\n" + "-" * 80)
-            print(f" ▶ '{device_alias}' 작업 완료 요약:")
-            print(f"   • 총 비디오 수    : {total_videos:,}개")
-            print(f"   • 신규 다운로드   : {downloaded_count:,}개")
-            print(f"   • 중복 건너뜀     : {skipped_count:,}개")
+            if is_incomplete:
+                remaining = total_videos - downloaded_count - skipped_count
+                print(f" ▶ '{device_alias}' 작업 중단 안내:")
+                print(f"   • 총 비디오 수    : {total_videos:,}개")
+                print(f"   • 신규 다운로드   : {downloaded_count:,}개")
+                print(f"   • 중복 건너뜀     : {skipped_count:,}개")
+                print(f"   • 미완료 비디오   : {remaining:,}개")
+                print(f"   ※ 연결 또는 세션 문제로 인해 일부 비디오만 처리되었습니다.")
+                print(f"      명령어를 다시 실행하시면 기존 다운로드된 파일은 자동으로 건너뛰고 이어서 다운로드됩니다.")
+            else:
+                print(f" ▶ '{device_alias}' 작업 완료 요약:")
+                print(f"   • 총 비디오 수    : {total_videos:,}개")
+                print(f"   • 신규 다운로드   : {downloaded_count:,}개")
+                print(f"   • 중복 건너뜀     : {skipped_count:,}개")
             print("-" * 80 + "\n", flush=True)
 
     if not result:
